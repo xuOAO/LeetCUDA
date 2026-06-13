@@ -31,22 +31,15 @@
 #include <torch/types.h>
 #include <vector>
 
-// 这些 cast 宏注释掉作为提示（让用户自己写出来）
-// #define WARP_SIZE 32
-// #define INT4(value) (reinterpret_cast<int4 *>(&(value))[0])
-// #define FLOAT4(value) (reinterpret_cast<float4 *>(&(value))[0])
-// #define HALF2(value) (reinterpret_cast<half2 *>(&(value))[0])
-// #define BFLOAT2(value) (reinterpret_cast<__nv_bfloat162 *>(&(value))[0])
-// #define LDST128BITS(value) (reinterpret_cast<float4 *>(&(value))[0])
-
-// 数值常量保留（如果 op 需要）
+// 数值常量保留（如果 op 需要它来钳制 dtype 范围）
 #define MAX_EXP_F32  88.3762626647949f
 #define MIN_EXP_F32 -88.3762626647949f
 #define MAX_EXP_F16 __float2half(11.089866488461016f)
 #define MIN_EXP_F16 __float2half(-9.704060527839234f)
 
-// 可选：保留 / 添加 __device__ helper（不要让答案太显然）
-// __device__ __forceinline__ float <op>(float x) { ... }
+// !!! 注意：参考实现里的 cast 宏（FLOAT4 / HALF2 / LDST128BITS / INT4 / BFLOAT2）
+// 和 __device__ helper（warp_reduce_*、block_reduce_*、MD struct 之类）一律删掉，
+// 不要在这里以注释形式保留——它们是练习对象。
 
 __global__ void <op>_f32_kernel(float *x, float *y, int N) {
   // TODO: implement scalar fp32 <op>
@@ -526,29 +519,17 @@ ncu --nvtx \
 #include <torch/types.h>
 #include <vector>
 
-#define WARP_SIZE 32
-#define WARP_MASK (WARP_SIZE - 1)
-#define WARP_SHIFT 5
-// LDST128BITS 注释掉作为提示
-// #define LDST128BITS(val) (reinterpret_cast<float4*>(&(val)))[0]
-
-// warp-level helper 保留作为基础结构（不掏空，否则 TODO 注释里也讲不清楚）
-template <const int kwarp_size = WARP_SIZE>
-__device__ __forceinline__ float warp_sum_f32(float sum_f32) {
-#pragma unroll
-  for (int mask = kwarp_size / 2; mask >= 1; mask >>= 1) {
-    sum_f32 += __shfl_xor_sync(0xffffffff, sum_f32, mask);
-  }
-  return sum_f32;
-}
+// !!! reduce 风格的 kernel 强烈依赖 warp_reduce / block_reduce / MD struct 这类
+// __device__ helper——但这些**就是练习对象**：写 reduce 的核心难度就在这里。
+// 一律删掉，不要在这里以注释形式保留。WARP_SIZE / cast 宏（LDST128BITS 等）也删掉。
+// 用户填 kernel 时会重新写出 warp shuffle 循环、shared memory 缩并、atomicAdd 收尾。
 
 template <const int NUM_THREADS = 1024>
 __global__ void <op>_f16x8_pack_kernel(half *x, float *y, int N) {
-  // TODO: implement fp16x8 pack <op> with shared-mem warp reduction + atomicAdd
-  //   1. load 128-bit (8x half) per thread, accumulate into float
-  //   2. warp_sum_f32, write lane-0 to shmem
-  //   3. warp 0 reduces shmem with warp_sum_f32<NUM_WARPS>
-  //   4. tid==0 atomicAdd into y
+  // TODO: fp16x8 pack <op> — block reduce + atomicAdd into scalar y.
+  //   load shape: 128-bit pack of 8 halves per thread.
+  //   accumulate into fp32 register (kernel returns fp32 scalar).
+  //   write final block result via atomicAdd.
 }
 
 #define STRINGFY(str) #str
@@ -562,7 +543,7 @@ __global__ void <op>_f16x8_pack_kernel(half *x, float *y, int N) {
   }
 
 // dispatch macros + TORCH_BINDING_REDUCE 完全照搬参考实现
-// （拷贝过来即可，不需要修改）
+// （拷贝过来即可，不需要修改 — 这部分是 binding 层，不是练习对象）
 ```
 
 完整的 dispatch / binding macros 看 `kernels/reduce/my_all_reduce.cu` 第 73-154 行。
@@ -574,6 +555,9 @@ __global__ void <op>_f16x8_pack_kernel(half *x, float *y, int N) {
 只保留最佳 kernel（通常是 `<op>_f16x8_pack_kernel`），名字保持原样（reduce 这条链已经是简洁名了），函数体掏空：
 
 ```cpp
+// 同 my_$op.cu — 不要把 warp/block reduce helper、cast 宏、MD struct 之类
+// 复制进 practice。它们是练习对象。
+
 template <const int NUM_THREADS = 1024>
 __global__ void <op>_f16_kernel(half *x, float *y, int N) {
   // TODO(practice): best FP16 <op> — 128-bit pack load + warp reduction + atomicAdd

@@ -83,18 +83,25 @@ reduce 这条链的"最佳"在仓库里直接是 `all_reduce_sum_f16x8_pack_kern
 
 ## §my_kernel.cu
 
-完整保留参考实现的所有结构，只把每个 `__global__` 的函数体替换成 TODO。规则：
+完整保留参考实现的**框架**结构（include / TORCH_BINDING / PYBIND），但 kernel 实现区域只留 `__global__` 签名 + TODO。规则：
 
-- include / namespace / 顶部 `#define` 全部保留。但把"会引诱用户直接抄答案"的 `FLOAT4` / `HALF2` / `BFLOAT2` / `LDST128BITS` / `INT4` 之类的 cast 宏注释掉（参考已有 `my_sigmoid.cu` / `my_relu.cu`），数值常量（`MAX_EXP_*` 之类）保留。
-- 参考实现里如果有 `__device__` helper（如 `warp_reduce_sum_f32`），保留。可以再补一两个明显有用的 `__device__` helper（如 `__device__ __forceinline__ <op>(...)`）作为提示——但只在不会让答案过于显然的前提下做。
-- 对每个 `__global__ void <name>_kernel(...)`：保留签名，函数体替换成
+- **include / namespace 全部保留**——build 链需要它们。
+- **顶部纯数值常量 / 类型 typedef 保留**：例如 `#define MAX_EXP_F32 88.3762626647949f`、`#define MIN_EXP_F16 ...` 这种数值上下限是**签名层面**的（决定 dtype 的合法范围），不是练习对象，保留。
+- **kernel 实现技巧相关的 `#define` 和 `__device__` 一律删除**，**不要**注释保留——这是这个 skill 的核心教学决策：
+  - **cast 宏**（`FLOAT4` / `HALF2` / `BFLOAT2` / `LDST128BITS` / `INT4`）：删掉，不留注释。让用户自己想到"这个变体要 128-bit 搬运 → 我要写 cast macro"。
+  - **`__device__` helper**（`warp_reduce_sum_f32` / `block_reduce_max_f32` / online softmax 的 `MD` struct + `warp_reduce_md_op` 等）：删掉。这些 helper 本身就是练习的一部分，复制过来用户就跳过了"怎么写 warp/block reduce""怎么定义 online merge 数据结构"这些核心练习。
+  - **`WARP_SIZE` 这类基础常量**：删掉。学生写 reduce 时自然要重新定义。
+  - 唯一例外：参考实现的某个 `__device__` helper **不**是练习对象（比如纯类型转换 utility，或者 op 数学定义本身——不是优化技巧），可以保留。但默认从严：**有疑问就删**。
+- **不要**自己补"明显有用的 `__device__` helper 作为提示"——这是反向的，给提示就削弱了练习效果。
+- **对每个 `__global__ void <name>_kernel(...)`**：保留签名（包括 templated `<int NUM_THREADS>`），函数体替换成
   ```cpp
   __global__ void sigmoid_f32x4_kernel(float *x, float *y, int N) {
     // TODO: implement fp32 vec4 sigmoid (FLOAT4 load/store)
   }
   ```
-  TODO 注释要简短描述这个变体的特征（向量宽度 / 是否 pack / 用什么宏 / 关键操作），让人填的时候有方向但不至于直接给出答案。
-- 所有 `#define STRINGFY` / `TORCH_BINDING_COMMON_EXTENSION` / `CHECK_TORCH_TENSOR_DTYPE` / `TORCH_BINDING_<OP>` 宏定义、所有 `TORCH_BINDING_<OP>(...)` 实例化、`PYBIND11_MODULE` 里的所有 `TORCH_BINDING_COMMON_EXTENSION(...)` 全保留，原封不动。
+  TODO 注释要简短描述这个变体的特征（向量宽度 / 是否 pack / 用什么宏 / 关键操作）让人有方向，但**不要**把答案写得太具体（比如别在 TODO 里写"调用 `block_reduce_sum_f32`"——helper 都被删了，这就是练习要重新想的东西）。
+- **所有 binding-side 代码全保留，原封不动**：`#define STRINGFY` / `TORCH_BINDING_COMMON_EXTENSION` / `CHECK_TORCH_TENSOR_DTYPE` / `TORCH_BINDING_<OP>` 宏定义、所有 `TORCH_BINDING_<OP>(...)` 实例化、`PYBIND11_MODULE` 里的所有 `m.def`。这部分是用户**填完 kernel 后立即能 build** 的保证，不能动。
+- 如果 reduce 风格的参考实现把 dispatch 逻辑写在 `LANUCH_*` / `DISPATCH_*` 宏里——这些**也**保留，它们是 binding 层。
 
 如果需要，可以参考 `references/templates.md` 里的"my_kernel.cu 骨架"部分对照修订。
 
@@ -109,6 +116,7 @@ reduce 这条链的"最佳"在仓库里直接是 `all_reduce_sum_f16x8_pack_kern
   - `sigmoid_f16x8_pack_kernel` → `sigmoid_f16_kernel`
   - `all_reduce_sum_f16x8_pack_kernel` → `all_reduce_sum_f16_kernel`
 - **当心 acc-type 后缀 ≠ 优化标签**。有些 kernel 名字编码了 accumulator dtype（典型例子：`dot_prod_f16x8_pack_f32_kernel`，末尾的 `_f32` 是"FP32 accumulator"，不是优化变体）。约定：识别"优化标签"只看 `x<num>` / `_pack` 这两类后缀；中间或末尾的 `_f32` / `_f16` 段如果**不是**这两类，就当成参与签名语义的一部分保留下来。比如 `dot_prod_f16x8_pack_f32` 简化成 `dot_prod_f16_f32`（保留 acc 后缀），不是 `dot_prod_f16`。如果不确定看一眼参考 cu 里的 kernel 是不是用相同 elem-dtype 但不同 acc-dtype 出现了多次——出现过就肯定是 acc 后缀。
+- **同 my_*.cu，kernel 实现区域只留 `__global__` 签名 + TODO**。不要把参考里的 `__device__` helper、`MD` struct、cast macros、`WARP_SIZE` 这些复制过来。practice 是"逼自己回忆出最佳实现长什么样"，把脚手架搭好就等于剧透。
 - 函数体替换成 `// TODO(practice): best <DTYPE> <op> — <最优形态简述>`。
 - TORCH_BINDING 宏可以**精简**（不需要 `if (ndim != 2)` 全分支，但要保留 `n_elements` 参数和 dtype 检查）——参照已有的 `practice_sigmoid.cu` / `practice_relu.cu`。把 `n_elements` 设成最佳 kernel 的向量宽度（标量=1，f32x4=4，f16x8_pack=8）。
 - 只 bind 简洁名（`sigmoid_f32` / `sigmoid_f16`），dtype × 1 个。
@@ -189,6 +197,6 @@ ncu --nvtx \
 
 - **kernel 里有 templated `__global__`**（如 `template <const int NUM_THREADS> __global__ void ...`）：保留模板参数和默认值，函数体掏空。
 - **多输入 / 多输出**：维持原签名，TODO 注释里说清楚每个参数代表什么。
-- **kernel 函数体里有内嵌的 `#define`**（如 sigmoid 参考里把 `FLOAT4` 内嵌在 kernel 里）：在 my 版里把它放到 kernel 函数体内、`// TODO` 上面，作为提示。
+- **kernel 函数体里有内嵌的 `#define`**（如 sigmoid 参考里把 `FLOAT4` 内嵌在 kernel 里）：删掉，不要保留也不要放到 TODO 上面。这些内嵌 cast 宏属于"实现技巧"，不是"签名"——和顶部的 cast 宏一视同仁删掉。
 - **CLAUDE.md 没在仓库里**：照样按这个 skill 描述的约定走，但提醒用户检查仓库根的 `CLAUDE.md` 看是否有更新的约定。
 - **目录里已经有 `my_*` 或 `practice_*` 文件**：先 `Read` 一下，如果内容像是用户写过的填充版（不只是脚手架），停下来问用户要不要覆盖；如果只是空脚手架可以直接覆盖，但还是先告诉用户一声。
