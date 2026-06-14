@@ -39,11 +39,20 @@ __device__ __forceinline__ float block_reduce_sum(float exp_sum) {
   }
   __syncthreads();
 
-  exp_sum = (lane_id < NUM_WARPS) ? shmem[lane_id] : 0.0f;
-  exp_sum = warp_reduce_sum<NUM_WARPS>(exp_sum);
-  exp_sum = __shfl_sync(0xffffffff, exp_sum, 0);
+  // exp_sum = (lane_id < NUM_WARPS) ? shmem[lane_id] : 0.0f;
+  // exp_sum = warp_reduce_sum<NUM_WARPS>(exp_sum);
+  // exp_sum = __shfl_sync(0xffffffff, exp_sum, 0);
 
-  return exp_sum;
+  // return exp_sum;
+  if (warp_id == 0) {
+    exp_sum = (tid < NUM_WARPS) ? shmem[tid] : 0.0f;
+    exp_sum = warp_reduce_sum<NUM_WARPS>(exp_sum);
+    if (tid == 0) {
+      shmem[0] = exp_sum;
+    }
+  }
+  __syncthreads();
+  return shmem[0];
 }
 
 template<const int reduce_size>
@@ -69,11 +78,20 @@ __device__ __forceinline__ float block_reduce_max(float x_max) {
   }
   __syncthreads();
 
-  x_max = (lane_id < NUM_WARPS) ? shmem[lane_id] : -FLT_MAX;
-  x_max = warp_reduce_max<NUM_WARPS>(x_max);
-  x_max = __shfl_sync(0xffffffff, x_max, 0);
+  // x_max = (lane_id < NUM_WARPS) ? shmem[lane_id] : -FLT_MAX;
+  // x_max = warp_reduce_max<NUM_WARPS>(x_max);
+  // x_max = __shfl_sync(0xffffffff, x_max, 0);
 
-  return x_max;
+  // return x_max;
+  if (warp_id == 0) {
+    x_max = (tid < NUM_WARPS) ? shmem[tid] : -FLT_MAX;
+    x_max = warp_reduce_max<NUM_WARPS>(x_max);
+    if (tid == 0) {
+      shmem[0] = x_max;
+    }
+  }
+  __syncthreads();
+  return shmem[0];
 }
 
 // NOTE: softmax per-token
@@ -198,10 +216,19 @@ __device__ __forceinline__ half block_reduce_max(half x_max) {
     shmem[warp_id] = x_max;
   }
   __syncthreads();
-  x_max = (lane_id < NUM_WARPS) ? shmem[lane_id] : -CUDART_MAX_NORMAL_FP16;
-  x_max = warp_reduce_max<NUM_WARPS>(x_max);
-  x_max = __shfl_sync(0xffffffff, x_max, 0);
-  return x_max;
+  // x_max = (lane_id < NUM_WARPS) ? shmem[lane_id] : -CUDART_MAX_NORMAL_FP16;
+  // x_max = warp_reduce_max<NUM_WARPS>(x_max);
+  // x_max = __shfl_sync(0xffffffff, x_max, 0);
+  // return x_max;
+  if (warp_id == 0) {
+    x_max = (tid < NUM_WARPS) ? shmem[tid] : -CUDART_MAX_NORMAL_FP16;
+    x_max = warp_reduce_max<NUM_WARPS>(x_max);
+    if (tid == 0) {
+      shmem[0] = x_max;
+    }
+  }
+  __syncthreads();
+  return shmem[0];
 }
 
 template <const int NUM_THREADS = 256>
@@ -324,11 +351,20 @@ __device__ __forceinline__ MD block_reduce_update_md(MD val) {
   }
   __syncthreads();
 
-  val = shmem[lane_id];
-  val = warp_reduce_update_md<NUM_WARPS>(val);
-  val.m = __shfl_sync(0xffffffff, val.m, 0);
-  val.d = __shfl_sync(0xffffffff, val.d, 0);
-  return val;
+  // val = shmem[lane_id];
+  // val = warp_reduce_update_md<NUM_WARPS>(val);
+  // val.m = __shfl_sync(0xffffffff, val.m, 0);
+  // val.d = __shfl_sync(0xffffffff, val.d, 0);
+  // return val;
+  if (warp_id == 0) {
+    val = (tid < NUM_WARPS) ? shmem[tid] : MD{-FLT_MAX, 0.0f};
+    val = warp_reduce_update_md<NUM_WARPS>(val);
+    if (tid == 0) {
+      shmem[0] = val;
+    }
+  }
+  __syncthreads();
+  return shmem[0];
 }
 
 template <const int NUM_THREADS = 256>
