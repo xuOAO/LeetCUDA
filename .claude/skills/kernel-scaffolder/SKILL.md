@@ -1,15 +1,14 @@
 ---
 name: kernel-scaffolder
-description: 在 LeetCUDA 仓库的某个 kernel 目录里，把上游参考实现 ($kernel.cu / $kernel.py) 转成两套学习用文件——my_$kernel.{cu,py,sh}（保留所有变体，掏空 __global__ 函数体作为 TODO）和 practice_$kernel.{cu,py}（每种 dtype 只留最佳 kernel）。在用户说"为 X 创建 my/practice 文件"、"把这套学习工作流推广到 X kernel"、"为 X 生成 my_X 和 practice_X"、"按 CLAUDE.md 的三层约定接入新 kernel"、或者类似的"按已有约定 scaffold 一个新 kernel 目录"诉求时使用。也覆盖只想生成其中一套（只 my 或只 practice）的场景。
+description: 在 LeetCUDA 仓库的某个 kernel 目录里，把上游参考实现 ($kernel.cu / $kernel.py) 转成两套学习用文件——my_$kernel.{cu,py} + my_profiling.py（保留所有变体，掏空 __global__ 函数体作为 TODO）和 practice_$kernel.{cu,py}（每种 dtype 只留最佳 kernel）。在用户说"为 X 创建 my/practice 文件"、"把这套学习工作流推广到 X kernel"、"为 X 生成 my_X 和 practice_X"、"按 CLAUDE.md 的三层约定接入新 kernel"、或者类似的"按已有约定 scaffold 一个新 kernel 目录"诉求时使用。也覆盖只想生成其中一套（只 my 或只 practice）的场景。
 ---
 
 # kernel-scaffolder
 
 把 LeetCUDA 仓库里某个 kernel 目录下的上游参考实现 `$kernel.cu` / `$kernel.py`，按仓库 CLAUDE.md 描述的约定生成两套学习用文件：
 
-- **`my_$kernel.{cu,py,sh}`** — 保留所有渐进版本（原 cu 里的所有 `__global__` kernel 全部留下），但把每个 kernel 函数体掏空换成 `// TODO: implement <这个变体在做什么>`。helper macros / `__device__` 辅助 / `TORCH_BINDING_*` 宏 / PyBind 注册全部原样保留，让 build 链能直接跑。Python driver 加上 `argparse` 暴露 `--benchmark` / `--no-check` / `--profiling <name>` / `--dtype` / `--S` / `--K`，build 目录搬到 `build/<lib_name>/`，nvcc 加 `-lineinfo`。
+- **`my_$kernel.{cu,py}` + `my_profiling.py`** — 保留所有渐进版本（原 cu 里的所有 `__global__` kernel 全部留下），但把每个 kernel 函数体掏空换成 `// TODO: implement <这个变体在做什么>`。helper macros / `__device__` 辅助 / `TORCH_BINDING_*` 宏 / PyBind 注册全部原样保留，让 build 链能直接跑。Python driver 加上 `argparse` 暴露 `--benchmark` / `--no-check` / `--profiling <name>` / `--S` / `--K`，build 目录搬到 `build/<lib_name>/`，nvcc 加 `-lineinfo`。`my_profiling.py` 是 ncu 的薄封装：维护一份 `kernels_dict`，`--all` 一次跑全套，`--kernel <name>` 跑单个。
 - **`practice_$kernel.{cu,py}`** — 每种 dtype 只留**最佳** kernel，函数名去掉优化后缀（如 `sigmoid_f32x4_kernel` → `sigmoid_f32_kernel`），函数体同样掏空标 TODO。Python driver 极简，只有 correctness + benchmark。
-- **`my_$kernel.sh`** — 一行 ncu 包装，方便 profiling。
 
 为什么要分两层：`my_*` 是渐进式学习用的——所有变体都在，对照原版一个一个填；`practice_*` 是反复练手用的——只有"最优"那一种，名字也去掉提示，逼自己回忆出最佳实现长什么样。
 
@@ -48,7 +47,7 @@ description: 在 LeetCUDA 仓库的某个 kernel 目录里，把上游参考实�
 
 7. **生成 `practice_$kernel.py`**。极简版，只跑最佳 kernel 的 correctness + benchmark。详见 §practice_kernel.py。
 
-8. **生成 `my_$kernel.sh`**。一行 ncu 包装，详见 §my_kernel.sh。
+8. **生成 `my_profiling.py`**。维护 `kernels_dict` 列出每个 kernel 的 dtype + 安全形状，`--all` 一次跑全套 ncu profiling，`--kernel <name>` 单跑一个。详见 §my_profiling.py。
 
 9. **检查产物**。每写完一组，做一遍机械检查：
    - `my_*.cu` 里所有原 kernel 都还在吗？所有 `TORCH_BINDING_*(...)` 调用、`PYBIND11_MODULE` 里的 `m.def`、helper macro 都在吗？
@@ -124,70 +123,129 @@ reduce 这条链的"最佳"在仓库里直接是 `all_reduce_sum_f16x8_pack_kern
 
 ## §my_kernel.py
 
-参考 `kernels/sigmoid/my_sigmoid.py` 和 `kernels/relu/my_relu.py`。要点：
+**核心方针：完全对齐参考 `$kernel.py`，只加自用功能。**
 
-- 顶部加 `_HERE` / `_BUILD_DIR`，`_BUILD_DIR = build/<kernel>_lib/`，os.makedirs 创建。
-- `torch.utils.cpp_extension.load` 的 `name=` 用 `<kernel>_lib`，`sources=[my_<kernel>.cu]` 走绝对路径，`build_directory=_BUILD_DIR`，`extra_cuda_cflags` 在原版基础上加 `-lineinfo`。
-- 三个核心函数：
-  - `run_benchmark(perf_func, x, tag, out=None, warmup=10, iters=1000, show_all=False)`
-  - `run_profiling(perf_func, x, tag, out=None, warmup=10)` —— 包 `nvtx.range_push("profiling")` / `range_pop()`
-  - `check_correctness(perf_func, x, tag, out=None, atol=1e-5, rtol=1e-5)` —— `ref = torch.<op>(x)`（element-wise op）或 `ref = torch.sum(x, dtype=torch.float32)`（reduce）等，根据 op 决定。
-- `run_benchmark_for_all_test(check=True)`：`Ss = Ks = [1024, 2048, 4096]`，对每个 (S, K) 跑：
-  - FP32 路径：参考 cu 里所有 f32 系 kernel + torch baseline，先 check_correctness（如果 check=True），再 run_benchmark。
-  - FP16 路径：同理，`atol/rtol=1e-3`。
-  - 如果有 bf16，加 bf16 路径。
-  - 如果是 reduce 风格（输出标量，没有 out 参数），照搬 `kernels/reduce/my_all_reduce.py` 的写法。
-- `run_profiling_for_test(kernel_name, dtype, S=4096, K=4096)`：分支到对应 kernel 调 `run_profiling`。
-- `if __name__ == "__main__":` 里 argparse 加 `--benchmark` / `--profiling` / `--dtype` / `--S` / `--K` / `--no-check`。
+`my_$kernel.py` 不是另起一套 benchmark，而是把参考 `$kernel.py` **当骨架**，在外面套上 argparse 入口、`check_correctness`、`run_profiling`、独立 build dir、`-lineinfo`。所有"参考实现里已经定下来的东西"——形状网格、`dim` 参数、`iters`、用到哪些 kernel、什么 dtype 走什么路径、打印格式——一律 **照搬不改**。
+
+参考 `kernels/sigmoid/my_sigmoid.py` 和 `kernels/relu/my_relu.py`。规则：
+
+**1. 必须照搬参考的部分（不要改、不要"优化"、不要"统一"）**：
+
+- 形状扫描：参考用 `Ss = Ks = [1024, 2048, 4096]` 的对角矩阵就照样；参考用 `S=4096, H ∈ {256, 512, 1024, ...}` 加几条特殊形状（softmax 风格）就照样。**禁止把所有 op 都套成 `{1024,2048,4096}²` 网格**——element-wise 和 reduce/row-wise 风格的 op 选形状的目的不一样，改了网格就和参考性能数据不可比。
+- `dim` 参数：参考写 `dim=1` 就是 `dim=1`，写 `dim=0` 就是 `dim=0`，写 `dim=-1` 就是 `dim=-1`。**`dim=1` 和 `dim=-1` 在 2D 张量上数学等价不构成改动理由**——参考的写法就是 spec。
+- `iters`、`warmup`、tag 字符串、`run_benchmark` 的输出格式、调用顺序、是否传 `out`——和参考保持字节级一致。
+- 跑哪些 kernel、跑哪些 dtype：参考的 `(S, K)` 块里在 fp32/fp16 路径下分别调了哪些 `lib.xxx`，照样列出来；参考某个形状跳过了某个 kernel（比如太大装不下），那就跳过。
+
+**2. 在参考之上只加这些"自用功能"**：
+
+- 顶部 `_HERE` / `_BUILD_DIR = build/<kernel>_lib/`，`os.makedirs(_BUILD_DIR, exist_ok=True)`。
+- `torch.utils.cpp_extension.load` 的 `name=` 用 `<kernel>_lib`、`sources=[my_<kernel>.cu]` 走绝对路径、`build_directory=_BUILD_DIR`、`extra_cuda_cflags` 在原版基础上加 `-lineinfo`。
+- `check_correctness(perf_func, x, tag, out=None, atol=1e-5, rtol=1e-5)`：ref 用参考实现里 torch baseline 的同一个调用形式（softmax 参考用 `torch.softmax(x, dim=1)`，那 ref 就是 `torch.softmax(x, dim=1)`，不是 `dim=-1`）。
+- `run_profiling(perf_func, src_shape, *, src_dtype, dst_dtype, warmup=10)`：**`src_shape` 是单个 tuple**（不是 `*src_shape` 变长——后者在调用方 `run_profiling(fn, src_shape, ...)` 时会变成嵌套 tuple `((S, K),)`，`torch.randn` 在某些 PyTorch 版本上侥幸能跑但语义错），内部包 `nvtx.range_push("profiling")` / `range_pop()`。**统一走 out 路径**——torch 的 element-wise / softmax / relu 这些 op 都接受 `out=` kwarg，不需要分 has_out 分支；torch baseline 用 `lambda x, out: torch.<op>(x, ..., out=out)` 包一下传进去（partial 不行，`out=` 必须在 call 时绑定）。
+- `run_profiling_for_test(kernel_name, src_shape=PROFILING_SHAPE)`：用 `match` / `case` 分支调 `run_profiling`，分支覆盖参考实现里 expose 的所有 kernel + torch baseline。每个分支硬编码自己的 `src_dtype` / `dst_dtype`（不再走 CLI `--dtype`）。
+- 把参考那种"把 benchmark 主体写在模块顶层、import 时立即跑"的写法搬进 `run_benchmark_for_all_test(check=True)` 函数体（结构 1:1 复制，只在每个 `run_benchmark(...)` 之前加 `if check: check_correctness(...)`）。
+- `if __name__ == "__main__":` argparse 加 `--benchmark` / `--profiling` / `--S` / `--K` / `--no-check`。`--K` 默认值取**所有 kernel 都能跑的最大公共形状**——参考 cu 里 dispatch 宏对 H 的最严格上限（softmax 这组里 `softmax_f32_per_token` 等几个只支持到 H=1024，所以默认给 1024）。**不要**加 `--dtype`——profiling 的 dtype 由 kernel 名唯一决定，写在 `match` 分支里就够了。
+
+**3. 当心的特殊形状**：
+
+- 如果参考实现里某些形状只跑部分 kernel（比如 H=8192 时只跑 `f16x8_pack`，因为 vec1/vec2 不够装），照搬这个选择就行——不要为了"统一"补齐。
+- 如果是 reduce 风格（输出标量、无 `out` 参数），照搬 `kernels/reduce/my_all_reduce.py` 的 reduce 写法（调用形式是 `out = perf_func(x)` 而非 `perf_func(x, out)`）。
 
 ## §practice_kernel.py
 
-参考 `kernels/sigmoid/practice_sigmoid.py` / `kernels/relu/practice_relu.py` / `kernels/reduce/practice_all_reduce.py`。要点：
+**核心方针：和 my_$kernel.py 一样照搬参考的形状网格 / dim / iters，但只跑每种 (algorithm, dtype) 组合的最佳 kernel + torch baseline。**
 
-- 顶部 docstring 说明这是 practice 版（一句话）。
-- `_BUILD_DIR = build/practice_<kernel>_lib/`。
-- `lib = load(name="practice_<kernel>_lib", sources=[practice_<kernel>.cu], ...)`。
+参考 `kernels/sigmoid/practice_sigmoid.py` / `kernels/relu/practice_relu.py` / `kernels/reduce/practice_all_reduce.py`。规则：
+
+**1. 必须照搬参考的部分**：
+
+- 形状网格：和 §my_kernel.py 同一个原则——参考 `$kernel.py` 用什么形状网格就用什么，不要写死 `{1024,2048,4096}²`。
+- `dim` 参数、`iters`、tag 字符串、`out` 是否传——同 my_*.py，照搬参考。
+- 如果某个形状下参考根本没跑最佳 kernel（比如最佳 kernel 的向量宽度装不下 H），那个形状就**跳过**这个 kernel（continue 或 if 守卫），不要硬跑会越界的形状。
+
+**2. 与 my_*.py 的差别**：
+
+- 顶部 docstring 一句话说明这是 practice 版。
+- `_BUILD_DIR = build/practice_<kernel>_lib/`；`lib = load(name="practice_<kernel>_lib", sources=[practice_<kernel>.cu], ...)`。
 - 只有两个函数：`check_correctness` 和 `run_benchmark`，签名和 my_*.py 里一致。
-- `run(check=True)`：对每个 (S, K) 跑每个 dtype 的最佳 kernel + torch baseline，累加 `all_ok`。
-- 末尾打印 ALL PASS / SOME FAIL 总结。
+- `run(check=True)`：循环参考的形状网格，每个形状只跑 dtype × 最佳 kernel + torch baseline，累加 `all_ok`。
+- 末尾打印 `ALL PASS` / `SOME FAIL`。
 - argparse 只有 `--no-check`，`exit(0 if ok else 1)`。
 
-## §my_kernel.sh
+## §my_profiling.py
 
-```bash
-#!/usr/bin/env bash
-set -e
+`my_profiling.py` 是 ncu 的薄 Python 封装——**不再生成 `my_$kernel.sh`**。维护一份 `kernels_dict` 列出所有要 profile 的 kernel，外层 `--all` 跑全套、`--kernel <name>` 跑一个。形状用一个**全局常量** `PROFILING_SHAPE`，取"所有 kernel 都能跑的最大公共形状"——这样：
 
-name=${1:-<kernel>_<默认 dtype 后缀，比如 f16>}
-dtype=${2:-<默认 dtype，比如 float16>}
+- 一份形状所有 kernel 都能用，不需要 per-kernel 元组绕来绕去；
+- 一次 `python3 my_profiling.py --all` 把所有 `.ncu-rep` 都生成到 `profiling/` 子目录；
+- 用 Python 而不是 shell，跨 kernel 复制粘贴时少踩 `set -e` / 路径转义之类的坑。
 
-ncu --nvtx \
-  --nvtx-include "profiling/" \
-  --set full \
-  --import-source yes \
-  -o "$name" \
-  -- python3 my_<kernel>.py --profiling "$name" --dtype "$dtype"
+模板：
+
+```python
+import os
+import argparse
+
+dump_path = os.path.join(os.path.dirname(__file__), "profiling")
+os.makedirs(dump_path, exist_ok=True)
+
+# 统一形状：所有 kernel 都能跑的最大公共形状。
+# 看参考 cu 里所有 DISPATCH_*_KERNEL 宏的 H case 上限，取最严格的那个。
+# softmax 这一组里某些 kernel 只到 H=1024，所以最大公共形状 = (4096, 1024)。
+PROFILING_SHAPE = (4096, 1024)
+S, K = PROFILING_SHAPE
+
+# kernel 名 -> dtype（仅作记录用——my_<op>.py 的 match 分支已经硬编码了 dtype）。
+# torch baseline 不进 dict —— ncu 跑 torch 没意义。
+kernels_dict = {
+    "<kernel_name_1>": "float32",
+    "<kernel_name_2>": "float32",
+    ...
+    "<best_f16_kernel>": "float16",
+}
+
+cmds = {
+    k: f'ncu --nvtx \
+        --nvtx-include "profiling/" \
+        --set full \
+        --import-source yes \
+        -f \
+        -o {os.path.join(dump_path, k)} \
+        -- python3 my_<kernel>.py --profiling {k} --S {S} --K {K}'
+    for k in kernels_dict
+}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Profile <kernel> kernels")
+    parser.add_argument("--all", "-a", action="store_true", help="Profile all kernels")
+    parser.add_argument("--kernel", "-k", type=str, help="Profile a specific kernel")
+    args = parser.parse_args()
+
+    if args.all:
+        for k, cmd in cmds.items():
+            print(f"Profiling {k}...")
+            os.system(cmd)
+    elif args.kernel:
+        if args.kernel in cmds:
+            print(f"Profiling {args.kernel}...")
+            os.system(cmds[args.kernel])
+        else:
+            print(f"Kernel {args.kernel} not found. Available: {list(cmds.keys())}")
 ```
 
-如果是 reduce 风格（没有 `--dtype` 参数），用：
+要点：
+- **`-f` 是必须的**——重跑时 ncu 默认会因为 `<name>.ncu-rep` 已存在而报错退出。
+- `PROFILING_SHAPE` 取"所有 kernel 都能跑的最大公共形状"。具体看参考 cu 里**每个** `DISPATCH_*_KERNEL` 宏的 `case` 列表的 H 上限，取最严格的一个——例如 softmax 这组：
 
-```bash
-#!/usr/bin/env bash
-set -e
+  | kernel | 最大支持 H |
+  | --- | --- |
+  | `softmax_f32_per_token` / `safe_softmax_f32_per_token` / `online_safe_softmax_f32_per_token` / `safe_softmax_f16_f32_per_token` | 1024 |
+  | `safe_softmax_f16x2_f32_per_token` | 2048 |
+  | `softmax_f32x4_per_token` / `safe_softmax_f32x4_per_token` / `online_safe_softmax_f32x4_pack_per_token` | 4096 |
+  | `safe_softmax_f16x8_pack_f32_per_token` | 8192 |
 
-name=${1:-<best_kernel_name>}
-
-ncu --nvtx \
-  --nvtx-include "profiling/" \
-  -k regex:"$name"_kernel \
-  --set full \
-  --import-source yes \
-  -f \
-  -o "$name" \
-  -- python3 my_<kernel>.py --profiling "$name"
-```
-
-记得 `chmod +x`（或者 Write 完之后让用户自己 chmod，提一下）。
+  所以 K=1024 是最大公共形状（往上加任何一个就有 kernel 不支持）。如果用户**只想 profile 部分 kernel**，可以拆出第二份 dict + 更大的形状；默认只生成"全 kernel × 公共形状"这一份。
+- reduce 风格只多一个 `-k regex:"<name>_kernel"` 过滤（限定 ncu 只采样目标 kernel，避免 reduce 链上初始化 / 收尾 kernel 也被采进来），其他完全一样。
 
 ## 对照模板
 

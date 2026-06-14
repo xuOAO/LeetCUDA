@@ -32,36 +32,17 @@ lib = load(
 )
 
 
-# ---------------------------------------------------------------------------
-# Per-kernel maximum supported head size (H). Driven by the dispatch macros
-# in my_softmax.cu — scalar variants cap at NUM_THREADS=1024 (so H=1024),
-# vec2 at H=2048, vec4 at H=4096, vec8 (f16x8_pack) at H=8192.
-# ---------------------------------------------------------------------------
-_MAX_H = {
-    "softmax_f32_per_token": 1024,
-    "softmax_f32x4_per_token": 4096,
-    "safe_softmax_f32_per_token": 1024,
-    "safe_softmax_f32x4_per_token": 4096,
-    "safe_softmax_f16_f32_per_token": 1024,
-    "safe_softmax_f16x2_f32_per_token": 2048,
-    "safe_softmax_f16x8_pack_f32_per_token": 8192,
-    "online_safe_softmax_f32_per_token": 1024,
-    "online_safe_softmax_f32x4_pack_per_token": 4096,
-}
-
-
 def run_benchmark(
     perf_func: callable,
     x: torch.Tensor,
     tag: str,
     out: Optional[torch.Tensor] = None,
     warmup: int = 10,
-    iters: int = 1000,
+    iters: int = 100,
     show_all: bool = False,
 ):
     if out is not None:
         out.fill_(0)
-    # warmup
     if out is not None:
         for _ in range(warmup):
             perf_func(x, out)
@@ -83,40 +64,33 @@ def run_benchmark(
     total_time = (end - start) * 1000  # ms
     mean_time = total_time / iters
     out_info = f"out_{tag}"
-    out_val = out.flatten().detach().cpu().numpy().tolist()[:2]
+    out_val = out.flatten().detach().cpu().numpy().tolist()[:3]
     out_val = [round(v, 8) for v in out_val]
     out_val = [f"{v:<12}" for v in out_val]
-    print(f"{out_info:>32}: {out_val}, time:{mean_time:.8f}ms")
+    print(f"{out_info:>24}: {out_val}, time:{mean_time:.8f}ms")
     if show_all:
         print(out)
     return out, mean_time
 
-
 def run_profiling(
     perf_func: callable,
-    x: torch.Tensor,
-    tag: str,
-    out: Optional[torch.Tensor] = None,
+    src_shape: tuple,
+    *,
+    src_dtype: torch.dtype,
+    dst_dtype: torch.dtype,
     warmup: int = 10,
 ):
-    if out is not None:
-        out.fill_(0)
-    if out is not None:
-        for _ in range(warmup):
-            perf_func(x, out)
-    else:
-        for _ in range(warmup):
-            _ = perf_func(x)
+    x = torch.randn(src_shape, device="cuda", dtype=src_dtype).contiguous()
+    out = torch.zeros_like(x, device="cuda", dtype=dst_dtype).contiguous()
+
+    for _ in range(warmup):
+        perf_func(x, out)
     torch.cuda.synchronize()
 
     torch.cuda.nvtx.range_push("profiling")
-    if out is not None:
-        perf_func(x, out)
-    else:
-        _ = perf_func(x)
+    perf_func(x, out)
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
-
 
 def check_correctness(
     perf_func: callable,
@@ -125,17 +99,14 @@ def check_correctness(
     out: Optional[torch.Tensor] = None,
     atol: float = 1e-5,
     rtol: float = 1e-5,
-    safe: bool = True,
 ) -> bool:
-    """Verify perf_func(x[, out]) matches torch.softmax(x, dim=-1).
+    """Verify perf_func(x[, out]) matches torch.softmax(x, dim=1).
 
-    `safe=False` -> compare against the unsafe naive form sum(exp(x))/exp(x).
-    Naive softmax overflows for input magnitudes ~> 80 in fp32; we generate
-    inputs from N(0, 1) so the unsafe path is still finite, and torch.softmax
-    is mathematically equivalent (it does max-sub internally), so we can use
-    torch.softmax as the reference for both safe and naive variants.
+    Inputs are 2D (S, H) drawn from N(0, 1); torch.softmax internally does
+    max-subtract so it serves as the reference for both safe and naive
+    variants (naive can still match because |x| stays ~O(1) at this scale).
     """
-    ref = torch.softmax(x, dim=-1)
+    ref = torch.softmax(x, dim=1)
     if out is not None:
         out.fill_(0)
         perf_func(x, out)
@@ -155,144 +126,306 @@ def check_correctness(
     return ok
 
 
-def _maybe_run(name, kernel_fn, x, out, tag, check, atol, rtol):
-    """Run check + benchmark only when H is supported by this kernel."""
-    H = x.size(-1)
-    if H > _MAX_H[name]:
-        return
+def _bench(perf_func, x, tag, out, check, atol, rtol):
+    """Tiny helper: optional correctness check + benchmark, in one call."""
     if check:
-        check_correctness(kernel_fn, x, tag, out, atol=atol, rtol=rtol)
-    run_benchmark(kernel_fn, x, tag, out)
+        check_correctness(perf_func, x, tag, out, atol=atol, rtol=rtol)
+    run_benchmark(perf_func, x, tag, out)
 
 
 def run_benchmark_for_all_test(check: bool = True):
-    Ss = [1024, 2048, 4096]
-    Ks = [1024, 2048, 4096]
-    SKs = [(S, K) for S in Ss for K in Ks]
+    # ------------------------------------------------------------------
+    # Mirror softmax.py: shapes, kernel dispatch sets, and dim=1 are kept
+    # 1:1 with the reference. Only addition is an optional correctness
+    # check before each run_benchmark.
+    # ------------------------------------------------------------------
 
-    for S, K in SKs:
-        print("-" * 100)
-        print(" " * 45 + f"S={S}, K={K}")
-        print("-" * 100)
+    # per token softmax
+    print("-" * 100)
+    S, H = 4096, 256
+    print(" " * 45 + f"S={S}, H={H}")
+    print("-" * 100)
+    x = torch.randn((S, H), device="cuda").cuda().float().contiguous()
+    out = torch.zeros_like(x).cuda().float().contiguous()
+    _bench(lib.softmax_f32_per_token, x, "f32(per)", out, check, 1e-5, 1e-5)
+    _bench(lib.softmax_f32x4_per_token, x, "f32x4(per)", out, check, 1e-5, 1e-5)
+    _bench(lib.safe_softmax_f32_per_token, x, "f32(safe)", out, check, 1e-5, 1e-5)
+    _bench(
+        lib.online_safe_softmax_f32_per_token, x, "f32(safe+online)", out,
+        check, 1e-5, 1e-5,
+    )
+    _bench(
+        lib.online_safe_softmax_f32x4_pack_per_token, x, "f32x4(safe+online)",
+        out, check, 1e-5, 1e-5,
+    )
+    _bench(
+        lib.safe_softmax_f32x4_per_token, x, "f32x4(safe)", out, check, 1e-5,
+        1e-5,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out), x, "f32_th(per)", None, check,
+        1e-5, 1e-5,
+    )
 
-        # ---- FP32 path ----
-        x = torch.randn((S, K)).cuda().float().contiguous()
-        y = torch.zeros_like(x).cuda().float().contiguous()
-        _maybe_run(
-            "softmax_f32_per_token",
-            lib.softmax_f32_per_token, x, y, "f32(naive)", check, 1e-5, 1e-5,
-        )
-        _maybe_run(
-            "softmax_f32x4_per_token",
-            lib.softmax_f32x4_per_token, x, y, "f32x4(naive)", check, 1e-5, 1e-5,
-        )
-        _maybe_run(
-            "safe_softmax_f32_per_token",
-            lib.safe_softmax_f32_per_token, x, y, "f32(safe)", check, 1e-5, 1e-5,
-        )
-        _maybe_run(
-            "safe_softmax_f32x4_per_token",
-            lib.safe_softmax_f32x4_per_token, x, y, "f32x4(safe)", check,
-            1e-5, 1e-5,
-        )
-        _maybe_run(
-            "online_safe_softmax_f32_per_token",
-            lib.online_safe_softmax_f32_per_token, x, y, "f32(safe+online)",
-            check, 1e-5, 1e-5,
-        )
-        _maybe_run(
-            "online_safe_softmax_f32x4_pack_per_token",
-            lib.online_safe_softmax_f32x4_pack_per_token, x, y,
-            "f32x4(safe+online)", check, 1e-5, 1e-5,
-        )
-        if check:
-            check_correctness(partial(torch.softmax, dim=-1), x, "f32_th")
-        run_benchmark(partial(torch.softmax, dim=-1, out=y), x, "f32_th", y)
+    print("-" * 100)
+    x_f16 = x.half().contiguous()
+    out_f16 = out.half().contiguous()
+    _bench(
+        lib.safe_softmax_f16_f32_per_token, x_f16, "f16f32(safe)", out_f16,
+        check, 1e-3, 1e-3,
+    )
+    _bench(
+        lib.safe_softmax_f16x2_f32_per_token, x_f16, "f16x2f32(safe)", out_f16,
+        check, 1e-3, 1e-3,
+    )
+    _bench(
+        lib.safe_softmax_f16x8_pack_f32_per_token, x_f16, "f16x8packf32(safe)",
+        out_f16, check, 1e-3, 1e-3,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out_f16), x_f16, "f16_th(per)", None,
+        check, 1e-3, 1e-3,
+    )
+    print("-" * 100)
 
-        # ---- FP16 path ----
-        print("-" * 100)
-        x_f16 = x.half().contiguous()
-        y_f16 = y.half().contiguous()
-        _maybe_run(
-            "safe_softmax_f16_f32_per_token",
-            lib.safe_softmax_f16_f32_per_token, x_f16, y_f16, "f16f32(safe)",
-            check, 1e-3, 1e-3,
-        )
-        _maybe_run(
-            "safe_softmax_f16x2_f32_per_token",
-            lib.safe_softmax_f16x2_f32_per_token, x_f16, y_f16,
-            "f16x2f32(safe)", check, 1e-3, 1e-3,
-        )
-        _maybe_run(
-            "safe_softmax_f16x8_pack_f32_per_token",
-            lib.safe_softmax_f16x8_pack_f32_per_token, x_f16, y_f16,
-            "f16x8packf32(safe)", check, 1e-3, 1e-3,
-        )
-        if check:
-            check_correctness(
-                partial(torch.softmax, dim=-1), x_f16, "f16_th",
-                atol=1e-3, rtol=1e-3,
-            )
-        run_benchmark(
-            partial(torch.softmax, dim=-1, out=y_f16), x_f16, "f16_th", y_f16,
-        )
-        print("-" * 100)
+    # per token softmax
+    print("-" * 100)
+    S, H = 4096, 512
+    print(" " * 45 + f"S={S}, H={H}")
+    print("-" * 100)
+    x = torch.randn((S, H), device="cuda").cuda().float().contiguous()
+    out = torch.zeros_like(x).cuda().float().contiguous()
+    _bench(lib.softmax_f32_per_token, x, "f32(per)", out, check, 1e-5, 1e-5)
+    _bench(lib.softmax_f32x4_per_token, x, "f32x4(per)", out, check, 1e-5, 1e-5)
+    _bench(lib.safe_softmax_f32_per_token, x, "f32(safe)", out, check, 1e-5, 1e-5)
+    _bench(
+        lib.online_safe_softmax_f32_per_token, x, "f32(safe+online)", out,
+        check, 1e-5, 1e-5,
+    )
+    _bench(
+        lib.online_safe_softmax_f32x4_pack_per_token, x, "f32x4(safe+online)",
+        out, check, 1e-5, 1e-5,
+    )
+    _bench(
+        lib.safe_softmax_f32x4_per_token, x, "f32x4(safe)", out, check, 1e-5,
+        1e-5,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out), x, "f32_th(per)", None, check,
+        1e-5, 1e-5,
+    )
+
+    print("-" * 100)
+    x_f16 = x.half().contiguous()
+    out_f16 = out.half().contiguous()
+    _bench(
+        lib.safe_softmax_f16_f32_per_token, x_f16, "f16f32(safe)", out_f16,
+        check, 1e-3, 1e-3,
+    )
+    _bench(
+        lib.safe_softmax_f16x2_f32_per_token, x_f16, "f16x2f32(safe)", out_f16,
+        check, 1e-3, 1e-3,
+    )
+    _bench(
+        lib.safe_softmax_f16x8_pack_f32_per_token, x_f16, "f16x8packf32(safe)",
+        out_f16, check, 1e-3, 1e-3,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out_f16), x_f16, "f16_th(per)", None,
+        check, 1e-3, 1e-3,
+    )
+    print("-" * 100)
+
+    # per token softmax
+    print("-" * 100)
+    S, H = 4096, 1024
+    print(" " * 45 + f"S={S}, H={H}")
+    print("-" * 100)
+    x = torch.randn((S, H), device="cuda").cuda().float().contiguous()
+    out = torch.zeros_like(x).cuda().float().contiguous()
+    _bench(lib.softmax_f32_per_token, x, "f32(per)", out, check, 1e-5, 1e-5)
+    _bench(lib.softmax_f32x4_per_token, x, "f32x4(per)", out, check, 1e-5, 1e-5)
+    _bench(lib.safe_softmax_f32_per_token, x, "f32(safe)", out, check, 1e-5, 1e-5)
+    _bench(
+        lib.online_safe_softmax_f32_per_token, x, "f32(safe+online)", out,
+        check, 1e-5, 1e-5,
+    )
+    _bench(
+        lib.online_safe_softmax_f32x4_pack_per_token, x, "f32x4(safe+online)",
+        out, check, 1e-5, 1e-5,
+    )
+    _bench(
+        lib.safe_softmax_f32x4_per_token, x, "f32x4(safe)", out, check, 1e-5,
+        1e-5,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out), x, "f32_th(per)", None, check,
+        1e-5, 1e-5,
+    )
+
+    print("-" * 100)
+    x_f16 = x.half().contiguous()
+    out_f16 = out.half().contiguous()
+    _bench(
+        lib.safe_softmax_f16_f32_per_token, x_f16, "f16f32(safe)", out_f16,
+        check, 1e-3, 1e-3,
+    )
+    _bench(
+        lib.safe_softmax_f16x2_f32_per_token, x_f16, "f16x2f32(safe)", out_f16,
+        check, 1e-3, 1e-3,
+    )
+    _bench(
+        lib.safe_softmax_f16x8_pack_f32_per_token, x_f16, "f16x8packf32(safe)",
+        out_f16, check, 1e-3, 1e-3,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out_f16), x_f16, "f16_th(per)", None,
+        check, 1e-3, 1e-3,
+    )
+    print("-" * 100)
+
+    # per token softmax
+    print("-" * 100)
+    S, H = 4096, 2048
+    print(" " * 45 + f"S={S}, H={H}")
+    print("-" * 100)
+    x = torch.randn((S, H), device="cuda").cuda().float().contiguous()
+    out = torch.zeros_like(x).cuda().float().contiguous()
+    _bench(lib.softmax_f32x4_per_token, x, "f32x4(per)", out, check, 1e-5, 1e-5)
+    _bench(
+        lib.safe_softmax_f32x4_per_token, x, "f32x4(safe)", out, check, 1e-5,
+        1e-5,
+    )
+    _bench(
+        lib.online_safe_softmax_f32x4_pack_per_token, x, "f32x4(safe+online)",
+        out, check, 1e-5, 1e-5,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out), x, "f32_th(per)", None, check,
+        1e-5, 1e-5,
+    )
+
+    print("-" * 100)
+    x_f16 = x.half().contiguous()
+    out_f16 = out.half().contiguous()
+    _bench(
+        lib.safe_softmax_f16x2_f32_per_token, x_f16, "f16x2f32(safe)", out_f16,
+        check, 1e-3, 1e-3,
+    )
+    _bench(
+        lib.safe_softmax_f16x8_pack_f32_per_token, x_f16, "f16x8packf32(safe)",
+        out_f16, check, 1e-3, 1e-3,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out_f16), x_f16, "f16_th(per)", None,
+        check, 1e-3, 1e-3,
+    )
+    print("-" * 100)
+
+    # per token softmax
+    print("-" * 100)
+    S, H = 4096, 4096
+    print(" " * 45 + f"S={S}, H={H}")
+    print("-" * 100)
+    x = torch.randn((S, H), device="cuda").cuda().float().contiguous()
+    out = torch.zeros_like(x).cuda().float().contiguous()
+    _bench(lib.softmax_f32x4_per_token, x, "f32x4(per)", out, check, 1e-5, 1e-5)
+    _bench(
+        lib.safe_softmax_f32x4_per_token, x, "f32x4(safe)", out, check, 1e-5,
+        1e-5,
+    )
+    _bench(
+        lib.online_safe_softmax_f32x4_pack_per_token, x, "f32x4(safe+online)",
+        out, check, 1e-5, 1e-5,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out), x, "f32_th(per)", None, check,
+        1e-5, 1e-5,
+    )
+
+    print("-" * 100)
+    x_f16 = x.half().contiguous()
+    out_f16 = out.half().contiguous()
+    _bench(
+        lib.safe_softmax_f16x8_pack_f32_per_token, x_f16, "f16x8packf32(safe)",
+        out_f16, check, 1e-3, 1e-3,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out_f16), x_f16, "f16_th(per)", None,
+        check, 1e-3, 1e-3,
+    )
+    print("-" * 100)
+
+    # per token softmax
+    print("-" * 100)
+    S, H = 4096, 8192
+    print(" " * 45 + f"S={S}, H={H}")
+    print("-" * 100)
+    x = torch.randn((S, H), device="cuda").cuda().float().contiguous()
+    out = torch.zeros_like(x).cuda().float().contiguous()
+    x_f16 = x.half().contiguous()
+    out_f16 = out.half().contiguous()
+    _bench(
+        lib.safe_softmax_f16x8_pack_f32_per_token, x_f16, "f16x8packf32(safe)",
+        out_f16, check, 1e-3, 1e-3,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out_f16), x_f16, "f16_th(per)", None,
+        check, 1e-3, 1e-3,
+    )
+
+    # per token softmax
+    print("-" * 100)
+    S, H = 8192, 8192
+    print(" " * 45 + f"S={S}, H={H}")
+    print("-" * 100)
+    x = torch.randn((S, H), device="cuda").cuda().float().contiguous()
+    out = torch.zeros_like(x).cuda().float().contiguous()
+    x_f16 = x.half().contiguous()
+    out_f16 = out.half().contiguous()
+    _bench(
+        lib.safe_softmax_f16x8_pack_f32_per_token, x_f16, "f16x8packf32(safe)",
+        out_f16, check, 1e-3, 1e-3,
+    )
+    _bench(
+        partial(torch.softmax, dim=1, out=out_f16), x_f16, "f16_th(per)", None,
+        check, 1e-3, 1e-3,
+    )
+    print("-" * 100)
 
 
 def run_profiling_for_test(
     kernel_name: str,
-    dtype: torch.dtype,
-    S: int = 4096,
-    K: int = 4096,
+    src_shape
 ):
-    x = torch.randn((S, K)).cuda().float().contiguous()
-    y = torch.zeros_like(x).cuda().float().contiguous()
-    x_half = x.half().contiguous()
-    y_half = y.half().contiguous()
-
-    if dtype == torch.float32:
-        if kernel_name == "softmax_f32_per_token":
-            run_profiling(lib.softmax_f32_per_token, x, "profiling", y)
-        elif kernel_name == "softmax_f32x4_per_token":
-            run_profiling(lib.softmax_f32x4_per_token, x, "profiling", y)
-        elif kernel_name == "safe_softmax_f32_per_token":
-            run_profiling(lib.safe_softmax_f32_per_token, x, "profiling", y)
-        elif kernel_name == "safe_softmax_f32x4_per_token":
-            run_profiling(lib.safe_softmax_f32x4_per_token, x, "profiling", y)
-        elif kernel_name == "online_safe_softmax_f32_per_token":
+    match kernel_name:
+        case "softmax_f32_per_token":
+            run_profiling(lib.softmax_f32_per_token, src_shape, src_dtype=torch.float32, dst_dtype=torch.float32)
+        case "softmax_f32x4_per_token":
+            run_profiling(lib.softmax_f32x4_per_token, src_shape, src_dtype=torch.float32, dst_dtype=torch.float32)
+        case "safe_softmax_f32_per_token":
+            run_profiling(lib.safe_softmax_f32_per_token, src_shape, src_dtype=torch.float32, dst_dtype=torch.float32)
+        case "safe_softmax_f32x4_per_token":
+            run_profiling(lib.safe_softmax_f32x4_per_token, src_shape, src_dtype=torch.float32, dst_dtype=torch.float32)
+        case "online_safe_softmax_f32_per_token":
+            run_profiling(lib.online_safe_softmax_f32_per_token, src_shape, src_dtype=torch.float32, dst_dtype=torch.float32)
+        case "online_safe_softmax_f32x4_pack_per_token":
+            run_profiling(lib.online_safe_softmax_f32x4_pack_per_token, src_shape, src_dtype=torch.float32, dst_dtype=torch.float32)
+        case "safe_softmax_f16_f32_per_token":
+            run_profiling(lib.safe_softmax_f16_f32_per_token, src_shape, src_dtype=torch.float16, dst_dtype=torch.float16)
+        case "safe_softmax_f16x2_f32_per_token":
+            run_profiling(lib.safe_softmax_f16x2_f32_per_token, src_shape, src_dtype=torch.float16, dst_dtype=torch.float16)
+        case "safe_softmax_f16x8_pack_f32_per_token":
+            run_profiling(lib.safe_softmax_f16x8_pack_f32_per_token, src_shape, src_dtype=torch.float16, dst_dtype=torch.float16)
+        case "softmax_th":
+            # torch.softmax accepts an `out=` kwarg, but we need to bind it at call time
+            # (partial would freeze it before the tensor exists). Wrap in a lambda.
             run_profiling(
-                lib.online_safe_softmax_f32_per_token, x, "profiling", y
+                lambda x, out: torch.softmax(x, dim=1, out=out),
+                src_shape, src_dtype=torch.float16, dst_dtype=torch.float16,
             )
-        elif kernel_name == "online_safe_softmax_f32x4_pack_per_token":
-            run_profiling(
-                lib.online_safe_softmax_f32x4_pack_per_token, x, "profiling", y
-            )
-        elif kernel_name == "softmax_th":
-            run_profiling(partial(torch.softmax, dim=-1), x, "profiling", y)
-        else:
-            raise ValueError(f"Unsupported FP32 kernel name: {kernel_name}")
-    elif dtype == torch.float16:
-        if kernel_name == "safe_softmax_f16_f32_per_token":
-            run_profiling(
-                lib.safe_softmax_f16_f32_per_token, x_half, "profiling", y_half
-            )
-        elif kernel_name == "safe_softmax_f16x2_f32_per_token":
-            run_profiling(
-                lib.safe_softmax_f16x2_f32_per_token, x_half, "profiling",
-                y_half,
-            )
-        elif kernel_name == "safe_softmax_f16x8_pack_f32_per_token":
-            run_profiling(
-                lib.safe_softmax_f16x8_pack_f32_per_token, x_half, "profiling",
-                y_half,
-            )
-        elif kernel_name == "softmax_th":
-            run_profiling(
-                partial(torch.softmax, dim=-1), x_half, "profiling", y_half
-            )
-        else:
-            raise ValueError(f"Unsupported FP16 kernel name: {kernel_name}")
-
+        case _:
+            raise ValueError(f"Unsupported kernel name: {kernel_name}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -304,14 +437,12 @@ if __name__ == "__main__":
         help="Run profiling for the given kernel name",
     )
     parser.add_argument(
-        "--dtype", type=str, default="float32",
-        help="Data type for profiling (float32 or float16)",
-    )
-    parser.add_argument(
         "--S", type=int, default=4096, help="Row size (seqlens) for profiling"
     )
     parser.add_argument(
-        "--K", type=int, default=4096, help="Column size (head size) for profiling"
+        "--K", type=int, default=1024,
+        help="Column size (head size) for profiling. "
+             "Default = largest H all kernels support.",
     )
     parser.add_argument(
         "--no-check", action="store_true",
@@ -322,5 +453,4 @@ if __name__ == "__main__":
     if args.benchmark:
         run_benchmark_for_all_test(check=not args.no_check)
     if args.profiling is not None:
-        dtype = torch.float32 if args.dtype == "float32" else torch.float16
-        run_profiling_for_test(args.profiling, dtype, S=args.S, K=args.K)
+        run_profiling_for_test(args.profiling, src_shape=(args.S, args.K))

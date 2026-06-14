@@ -10,9 +10,11 @@ Use this for repeated practice after working through my_softmax.{cu,py}:
       * online_safe_softmax_f32       — online safe, FP32 vec4 single-pass
   - Two features only: check_correctness and benchmark
   - Plain kernel names (no x4 / _pack hints), so you re-derive the optimal form
+  - Shape grid mirrors softmax.py (S=4096 across H sweep + (8192,8192))
 """
 
 import argparse
+import os
 import time
 from functools import partial
 from typing import Optional
@@ -22,9 +24,13 @@ from torch.utils.cpp_extension import load
 
 torch.set_grad_enabled(False)
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_BUILD_DIR = os.path.join(_HERE, "build", "practice_softmax_lib")
+os.makedirs(_BUILD_DIR, exist_ok=True)
+
 lib = load(
     name="practice_softmax_lib",
-    sources=["practice_softmax.cu"],
+    sources=[os.path.join(_HERE, "practice_softmax.cu")],
     extra_cuda_cflags=[
         "-O3",
         "-U__CUDA_NO_HALF_OPERATORS__",
@@ -36,7 +42,24 @@ lib = load(
         "--use_fast_math",
     ],
     extra_cflags=["-std=c++17"],
+    build_directory=_BUILD_DIR,
 )
+
+
+# ---------------------------------------------------------------------------
+# Best-kernel max-H limits driven by practice_softmax.cu's DISPATCH_PRACTICE:
+#   NT = H / n_elements must land in {32, 64, 128, 256, 512, 1024}.
+#   - fp32 vec4 (n_elements=4) -> max H = 4096
+#   - fp16 pack8 (n_elements=8) -> max H = 8192
+# Forms that overshoot the table fall through `default` and raise — guard
+# them out per-shape so the H=8192 row still runs the fp16 kernel.
+# ---------------------------------------------------------------------------
+_MAX_H = {
+    "softmax_f32_per_token": 4096,
+    "safe_softmax_f32_per_token": 4096,
+    "online_safe_softmax_f32_per_token": 4096,
+    "safe_softmax_f16_f32_per_token": 8192,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +73,7 @@ def check_correctness(
     atol: float = 1e-5,
     rtol: float = 1e-5,
 ) -> bool:
-    ref = torch.softmax(x, dim=-1)
+    ref = torch.softmax(x, dim=1)
     if out is not None:
         out.fill_(0)
         perf_func(x, out)
@@ -79,7 +102,7 @@ def run_benchmark(
     tag: str,
     out: Optional[torch.Tensor] = None,
     warmup: int = 10,
-    iters: int = 1000,
+    iters: int = 100,
 ) -> float:
     if out is not None:
         out.fill_(0)
@@ -101,66 +124,72 @@ def run_benchmark(
     end = time.time()
 
     mean_ms = (end - start) * 1000.0 / iters
-    out_val = out.flatten().detach().cpu().tolist()[:2]
+    out_val = out.flatten().detach().cpu().tolist()[:3]
     out_val = [f"{round(v, 8):<12}" for v in out_val]
-    print(f"{'out_' + tag:>32}: {out_val}, time:{mean_ms:.8f}ms")
+    print(f"{'out_' + tag:>24}: {out_val}, time:{mean_ms:.8f}ms")
     return mean_ms
 
 
+def _bench(name, perf_func, x, tag, out, check, atol, rtol):
+    """Skip kernels that would blow past the dispatch table for this H."""
+    if name is not None and x.size(-1) > _MAX_H[name]:
+        return True  # treat skipped as ok
+    ok = True
+    if check:
+        ok = check_correctness(perf_func, x, tag, out, atol=atol, rtol=rtol)
+    run_benchmark(perf_func, x, tag, out)
+    return ok
+
+
 # ---------------------------------------------------------------------------
-# Main driver
+# Main driver — shape grid mirrors softmax.py exactly.
 # ---------------------------------------------------------------------------
 def run(check: bool = True):
-    Ss = [1024, 2048, 4096]
-    Ks = [1024, 2048, 4096]
     all_ok = True
 
-    for S, K in [(s, k) for s in Ss for k in Ks]:
+    SHs = [(4096, 256), (4096, 512), (4096, 1024), (4096, 2048),
+           (4096, 4096), (4096, 8192), (8192, 8192)]
+
+    for S, H in SHs:
         print("-" * 100)
-        print(" " * 45 + f"S={S}, K={K}")
+        print(" " * 45 + f"S={S}, H={H}")
         print("-" * 100)
 
         # ---- FP32 ----
-        x = torch.randn((S, K)).cuda().float().contiguous()
-        y = torch.zeros_like(x)
-        if check:
-            all_ok &= check_correctness(
-                lib.softmax_f32_per_token, x, "f32(naive)", y
-            )
-            all_ok &= check_correctness(
-                lib.safe_softmax_f32_per_token, x, "f32(safe)", y
-            )
-            all_ok &= check_correctness(
-                lib.online_safe_softmax_f32_per_token, x, "f32(safe+online)", y
-            )
-            all_ok &= check_correctness(
-                partial(torch.softmax, dim=-1), x, "f32_th"
-            )
-        run_benchmark(lib.softmax_f32_per_token, x, "f32(naive)", y)
-        run_benchmark(lib.safe_softmax_f32_per_token, x, "f32(safe)", y)
-        run_benchmark(
-            lib.online_safe_softmax_f32_per_token, x, "f32(safe+online)", y
+        x = torch.randn((S, H), device="cuda").cuda().float().contiguous()
+        y = torch.zeros_like(x).cuda().float().contiguous()
+        all_ok &= _bench(
+            "softmax_f32_per_token",
+            lib.softmax_f32_per_token, x, "f32(naive)", y, check, 1e-5, 1e-5,
         )
-        run_benchmark(partial(torch.softmax, dim=-1, out=y), x, "f32_th", y)
+        all_ok &= _bench(
+            "safe_softmax_f32_per_token",
+            lib.safe_softmax_f32_per_token, x, "f32(safe)", y, check, 1e-5, 1e-5,
+        )
+        all_ok &= _bench(
+            "online_safe_softmax_f32_per_token",
+            lib.online_safe_softmax_f32_per_token, x, "f32(safe+online)", y,
+            check, 1e-5, 1e-5,
+        )
+        all_ok &= _bench(
+            None,
+            partial(torch.softmax, dim=1, out=y), x, "f32_th", None, check,
+            1e-5, 1e-5,
+        )
 
         # ---- FP16 ----
         print("-" * 100)
         x_f16 = x.half().contiguous()
         y_f16 = y.half().contiguous()
-        if check:
-            all_ok &= check_correctness(
-                lib.safe_softmax_f16_f32_per_token, x_f16,
-                "f16f32(safe)", y_f16, atol=1e-3, rtol=1e-3,
-            )
-            all_ok &= check_correctness(
-                partial(torch.softmax, dim=-1), x_f16, "f16_th",
-                atol=1e-3, rtol=1e-3,
-            )
-        run_benchmark(
-            lib.safe_softmax_f16_f32_per_token, x_f16, "f16f32(safe)", y_f16
+        all_ok &= _bench(
+            "safe_softmax_f16_f32_per_token",
+            lib.safe_softmax_f16_f32_per_token, x_f16, "f16f32(safe)", y_f16,
+            check, 1e-3, 1e-3,
         )
-        run_benchmark(
-            partial(torch.softmax, dim=-1, out=y_f16), x_f16, "f16_th", y_f16
+        all_ok &= _bench(
+            None,
+            partial(torch.softmax, dim=1, out=y_f16), x_f16, "f16_th", None,
+            check, 1e-3, 1e-3,
         )
         print("-" * 100)
 

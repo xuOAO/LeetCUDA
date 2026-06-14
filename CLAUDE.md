@@ -13,7 +13,7 @@ LeetCUDA 是一个 CUDA 学习笔记仓库：`kernels/` 下每个 kernel 一个�
 | 层级 | 文件 | 用途 |
 | --- | --- | --- |
 | **参考** | `$kernel.cu` / `$kernel.py` | 上游原版。性能基线，渐进式实现的参考。在还没接入这套工作流的目录（如 `elementwise/` 和 `kernels/*` 下大多数目录）可能只有这一套。除非同步上游，否则别动。 |
-| **学习 (my)** | `my_$kernel.cu` / `my_$kernel.py` / `my_$kernel.sh` | 完整保留所有渐进版本，但把所有 `__global__` 函数体掏空（只剩签名 + `// TODO`）。Python driver 增加 `check_correctness`、`--benchmark`、`--profiling`（NVTX 包裹）三类入口。 |
+| **学习 (my)** | `my_$kernel.cu` / `my_$kernel.py` / `my_profiling.py` | 完整保留所有渐进版本，但把所有 `__global__` 函数体掏空（只剩签名 + `// TODO`）。Python driver 增加 `check_correctness`、`--benchmark`、`--profiling`（NVTX 包裹）三类入口。`my_profiling.py` 是 `ncu` 的薄 Python 封装（取代旧的 `my_$kernel.sh`）。 |
 | **练手 (practice)** | `practice_$kernel.cu` / `practice_$kernel.py` | 每种 dtype 只保留**最佳** kernel，去掉名字里的优化标签（如 `sigmoid_f32` 而不是 `sigmoid_f32x4`、`relu_f16` 而不是 `relu_f16x8_pack`）。用于反复练手。 |
 
 注：`kernels/reduce/` 是个特例——既有 `block_all_reduce.{cu,py}`（上游完整版），又有 `all_reduce.{cu,py}`（精简后的 f16 渐进参考）；该目录下的 `my_` / `practice_` 文件对应的是 f16 reduce 这条链。
@@ -22,7 +22,7 @@ LeetCUDA 是一个 CUDA 学习笔记仓库：`kernels/` 下每个 kernel 一个�
 - `my_$kernel.cu` 与 `$kernel.cu` 完全一致，仅把每个 `__global__` 的函数体替换成 `// TODO`（PyTorch 绑定、helper 宏、`__device__` 辅助函数都保留）。
 - `practice_$kernel.cu` 只保留每种 dtype 的最佳 kernel 签名（一种 dtype 一个），名字去掉优化后缀，但仍然走 `TORCH_BINDING_*` 宏接进 PyTorch。
 - `my_$kernel.py` 参照 `kernels/sigmoid/my_sigmoid.py` / `kernels/relu/my_relu.py`：用 `argparse` 暴露 `--benchmark`、`--no-check`、`--profiling <kernel_name>`、`--dtype`、`--S`、`--K`；build 目录放在 `build/<lib_name>/`。
-- `my_$kernel.sh` 是 `ncu` 的薄封装：`ncu --nvtx --nvtx-include "profiling/" --set full --import-source yes -k regex:"<name>_kernel" -o "$name" -- python3 my_$kernel.py --profiling "$name"`。
+- `my_profiling.py` 是 `ncu` 的薄 Python 封装：维护 `kernels_dict`（kernel 名 → dtype + 该 kernel 安全的 (S, K)），`--all` 跑全套、`--kernel <name>` 跑单个。每个 kernel 用各自 dispatch 宏支持的最小安全形状（不要一刀切最大形状，否则 H 上限低的 kernel 会被打挂）。早期目录里的 `my_$kernel.sh` 是同等的 shell 版本，新目录推荐直接用 `my_profiling.py`。
 
 ## 常用命令
 
@@ -42,6 +42,9 @@ python3 my_sigmoid.py --profiling sigmoid_f16x8_pack --dtype float16
 python3 my_sigmoid.py --profiling sigmoid_f32x4     --dtype float32 --S 4096 --K 4096
 
 # 一键 ncu profiling，结果落到当前目录的 <name>.ncu-rep
+python3 my_profiling.py --all                    # 全部 kernel
+python3 my_profiling.py --kernel sigmoid_f16x8_pack
+# 早期目录可能仍是 shell 版本：
 ./my_sigmoid.sh                                  # 默认 kernel + dtype
 ./my_sigmoid.sh sigmoid_f16x8_pack float16
 
@@ -72,5 +75,5 @@ pre-commit run --all-files
 
 - `__global__` kernel 命名编码了变体：`<op>_<elem-dtype>[x<vec-width>][_pack]_kernel`（如 `sigmoid_f16x8_pack_kernel`、`block_all_reduce_sum_f16x8_pack_f32_kernel`）。Torch 绑定名去掉 `_kernel`，并通过 `.cu` 文件底部的 `TORCH_BINDING_*` 宏接出去——保持这个模式。
 - 向量化 load/store 全仓共用同一组 cast 宏：`FLOAT4`、`HALF2`、`LDST128BITS`（用 `float4*` cast 来做 128-bit 搬运）。不要另起炉灶。
-- `my_$kernel.py` 的 benchmark 默认跑 `Ss × Ks ∈ {1024, 2048, 4096}²` 的形状网格。新 kernel 接入时也按这个网格走，性能数据才能横向比较。
+- `my_$kernel.py` / `practice_$kernel.py` 的形状网格、`dim` 参数、`iters`、调用顺序都**直接照搬参考 `$kernel.py`**，只在外面套 argparse / `check_correctness` / `run_profiling` / 独立 build dir / `-lineinfo` 这些自用功能。不要把所有 op 都套成 `{1024,2048,4096}²` 网格——element-wise 和 reduce/row-wise 风格的形状选择目的不同（前者是不同总元素数，后者 H 维决定 vec 分支），改了形状就和参考性能数据不可比。
 - 数值上敏感的 kernel（sigmoid、gelu、softmax）记得 clamp 到对应 dtype 的 `MIN_EXP_*` / `MAX_EXP_*` 常量——参见 `kernels/sigmoid/my_sigmoid.cu`。

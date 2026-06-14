@@ -7,12 +7,12 @@
 - [element-wise: practice_$op.cu](#element-wise-practice_opcu)
 - [element-wise: my_$op.py](#element-wise-my_oppy)
 - [element-wise: practice_$op.py](#element-wise-practice_oppy)
-- [element-wise: my_$op.sh](#element-wise-my_opsh)
+- [element-wise: my_profiling.py](#element-wise-my_profilingpy)
 - [reduce: my_$op.cu](#reduce-my_opcu)
 - [reduce: practice_$op.cu](#reduce-practice_opcu)
 - [reduce: my_$op.py](#reduce-my_oppy)
 - [reduce: practice_$op.py](#reduce-practice_oppy)
-- [reduce: my_$op.sh](#reduce-my_opsh)
+- [reduce: my_profiling.py](#reduce-my_profilingpy)
 
 ---
 
@@ -175,11 +175,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 ## element-wise: my_$op.py
 
-参考 `kernels/sigmoid/my_sigmoid.py` / `kernels/relu/my_relu.py`。这里给一个最小框架，按需扩展所有 dtype 路径：
+参考 `kernels/sigmoid/my_sigmoid.py` / `kernels/relu/my_relu.py`。
+
+**核心方针：把参考 `$op.py` 当骨架照搬（形状网格 / `dim` 参数 / `iters` / 调用顺序 / tag 一律不改），只在外面加 argparse + check + profiling + build_dir + `-lineinfo`。** 下面只给"自用功能"骨架；中间 `run_benchmark_for_all_test` 的具体形状循环要从参考 `$op.py` 里**原样搬过来**，每个 `run_benchmark(...)` 之前加一行 `if check: check_correctness(...)`，**不要**写死成 `[1024,2048,4096]²`。
 
 ```python
 import os
 import time
+from functools import partial
 from typing import Optional
 import argparse
 
@@ -214,6 +217,7 @@ lib = load(
 
 def run_benchmark(perf_func, x, tag, out: Optional[torch.Tensor] = None,
                   warmup: int = 10, iters: int = 1000, show_all: bool = False):
+    # 注意：iters 默认值与参考 $op.py 保持一致；如果参考用的是 100 就改成 100。
     if out is not None:
         out.fill_(0)
         for _ in range(warmup):
@@ -242,28 +246,31 @@ def run_benchmark(perf_func, x, tag, out: Optional[torch.Tensor] = None,
     return out, mean_time
 
 
-def run_profiling(perf_func, x, tag, out: Optional[torch.Tensor] = None, warmup: int = 10):
-    if out is not None:
-        out.fill_(0)
-        for _ in range(warmup):
-            perf_func(x, out)
-    else:
-        for _ in range(warmup):
-            _ = perf_func(x)
+def run_profiling(perf_func, src_shape, *, src_dtype, dst_dtype, warmup: int = 10):
+    # NOTE: src_shape 是单个 tuple，不要写成 *src_shape——后者会让调用方
+    # `run_profiling(fn, src_shape, ...)` 把 (S, K) 包成 ((S, K),)，torch.randn
+    # 在某些 PyTorch 版本上侥幸能跑但语义错。
+    # 统一走 out 路径——torch element-wise / softmax / relu 的 op 都接受 out= kwarg。
+    x = torch.randn(src_shape, device="cuda", dtype=src_dtype).contiguous()
+    out = torch.zeros_like(x, device="cuda", dtype=dst_dtype).contiguous()
+
+    for _ in range(warmup):
+        perf_func(x, out)
     torch.cuda.synchronize()
 
     torch.cuda.nvtx.range_push("profiling")
-    if out is not None:
-        perf_func(x, out)
-    else:
-        _ = perf_func(x)
+    perf_func(x, out)
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
 
 
 def check_correctness(perf_func, x, tag, out: Optional[torch.Tensor] = None,
                       atol: float = 1e-5, rtol: float = 1e-5) -> bool:
-    ref = torch.<op>(x)  # 例：torch.sigmoid / torch.relu / torch.nn.functional.gelu
+    # ref 的写法**必须**和参考 $op.py 里 torch baseline 调用形式完全一致：
+    #   - sigmoid:        ref = torch.sigmoid(x)
+    #   - softmax dim=1:  ref = torch.softmax(x, dim=1)        ← 不要改成 dim=-1
+    #   - reduce sum:     ref = torch.sum(x, dtype=torch.float32)
+    ref = torch.<op>(x)
     if out is not None:
         out.fill_(0)
         perf_func(x, out)
@@ -281,78 +288,68 @@ def check_correctness(perf_func, x, tag, out: Optional[torch.Tensor] = None,
 
 
 def run_benchmark_for_all_test(check: bool = True):
-    Ss = [1024, 2048, 4096]
-    Ks = [1024, 2048, 4096]
-    for S, K in [(s, k) for s in Ss for k in Ks]:
-        print("-" * 85)
-        print(" " * 40 + f"S={S}, K={K}")
-        x = torch.randn((S, K)).cuda().float().contiguous()
-        y = torch.zeros_like(x).cuda().float().contiguous()
-        if check:
-            check_correctness(lib.<op>_f32, x, "f32", y)
-            check_correctness(lib.<op>_f32x4, x, "f32x4", y)
-            check_correctness(torch.<op>, x, "f32_th")
-        run_benchmark(lib.<op>_f32, x, "f32", y)
-        run_benchmark(lib.<op>_f32x4, x, "f32x4", y)
-        run_benchmark(torch.<op>, x, "f32_th")
-
-        print("-" * 85)
-        x_f16 = x.half().contiguous()
-        y_f16 = y.half().contiguous()
-        if check:
-            check_correctness(lib.<op>_f16, x_f16, "f16", y_f16, atol=1e-3, rtol=1e-3)
-            check_correctness(lib.<op>_f16x2, x_f16, "f16x2", y_f16, atol=1e-3, rtol=1e-3)
-            check_correctness(lib.<op>_f16x8, x_f16, "f16x8", y_f16, atol=1e-3, rtol=1e-3)
-            check_correctness(lib.<op>_f16x8_pack, x_f16, "f16x8pack", y_f16, atol=1e-3, rtol=1e-3)
-            check_correctness(torch.<op>, x_f16, "f16_th", atol=1e-3, rtol=1e-3)
-        run_benchmark(lib.<op>_f16, x_f16, "f16", y_f16)
-        run_benchmark(lib.<op>_f16x2, x_f16, "f16x2", y_f16)
-        run_benchmark(lib.<op>_f16x8, x_f16, "f16x8", y_f16)
-        run_benchmark(lib.<op>_f16x8_pack, x_f16, "f16x8pack", y_f16)
-        run_benchmark(torch.<op>, x_f16, "f16_th")
-        print("-" * 85)
+    # ============================================================
+    # 把参考 $op.py 的 benchmark 主体（顶层 for 循环 / 形状常量 /
+    # `run_benchmark(lib.xxx, x, "...", out)` 调用序列）**原样**搬到这里。
+    # 唯一允许的改动：每个 run_benchmark 之前加 `if check: check_correctness(...)`。
+    # 不要把所有 op 都套成 [1024,2048,4096]² 网格，这会丢掉参考实现的 shape 选择意图。
+    # ============================================================
+    ...  # ← 从参考 $op.py 复制 benchmark 主体过来
 
 
-def run_profiling_for_test(kernel_name, dtype, S=4096, K=4096):
-    x = torch.randn((S, K)).cuda().float().contiguous()
-    y = torch.zeros_like(x).cuda().float().contiguous()
-    x_half = x.half().contiguous()
-    y_half = y.half().contiguous()
-
-    if dtype == torch.float32:
-        if kernel_name == "<op>_f32":     run_profiling(lib.<op>_f32, x, "profiling", y)
-        elif kernel_name == "<op>_f32x4": run_profiling(lib.<op>_f32x4, x, "profiling", y)
-        elif kernel_name == "<op>_th":    run_profiling(torch.<op>, x, "profiling")
-        else: raise ValueError(f"Unsupported kernel name: {kernel_name}")
-    elif dtype == torch.float16:
-        if kernel_name == "<op>_f16":          run_profiling(lib.<op>_f16, x_half, "profiling", y_half)
-        elif kernel_name == "<op>_f16x2":      run_profiling(lib.<op>_f16x2, x_half, "profiling", y_half)
-        elif kernel_name == "<op>_f16x8":      run_profiling(lib.<op>_f16x8, x_half, "profiling", y_half)
-        elif kernel_name == "<op>_f16x8_pack": run_profiling(lib.<op>_f16x8_pack, x_half, "profiling", y_half)
-        elif kernel_name == "<op>_th":         run_profiling(torch.<op>, x_half, "profiling")
-        else: raise ValueError(f"Unsupported kernel name: {kernel_name}")
+def run_profiling_for_test(kernel_name: str, src_shape=(4096, 1024)):
+    # 用 match/case 分支覆盖参考实现里 expose 的所有 kernel + torch baseline。
+    # 每个分支硬编码自己的 src_dtype / dst_dtype——不再走 CLI --dtype。
+    # 默认 src_shape 取"所有 kernel 都能跑的最大公共形状"（看每个 DISPATCH 宏的
+    # H case 上限取最严格的那个）。
+    match kernel_name:
+        case "<op>_f32":
+            run_profiling(lib.<op>_f32, src_shape,
+                          src_dtype=torch.float32, dst_dtype=torch.float32)
+        case "<op>_f32x4":
+            run_profiling(lib.<op>_f32x4, src_shape,
+                          src_dtype=torch.float32, dst_dtype=torch.float32)
+        case "<op>_f16":
+            run_profiling(lib.<op>_f16, src_shape,
+                          src_dtype=torch.float16, dst_dtype=torch.float16)
+        case "<op>_f16x2":
+            run_profiling(lib.<op>_f16x2, src_shape,
+                          src_dtype=torch.float16, dst_dtype=torch.float16)
+        case "<op>_f16x8_pack":
+            run_profiling(lib.<op>_f16x8_pack, src_shape,
+                          src_dtype=torch.float16, dst_dtype=torch.float16)
+        case "<op>_th":
+            # torch 的 element-wise / softmax 也接受 out= kwarg，但要在 call 时绑定
+            # （partial 会在创建时 freeze，那时 out tensor 还不存在）。用 lambda 包一下。
+            run_profiling(
+                lambda x, out: torch.<op>(x, out=out),
+                src_shape, src_dtype=torch.float16, dst_dtype=torch.float16,
+            )
+        case _:
+            raise ValueError(f"Unsupported kernel name: {kernel_name}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--profiling", type=str, default=None)
-    parser.add_argument("--dtype", type=str, default="float32")
     parser.add_argument("--S", type=int, default=4096)
-    parser.add_argument("--K", type=int, default=4096)
+    parser.add_argument("--K", type=int, default=1024,
+                        help="Default = the largest H all kernels support.")
     parser.add_argument("--no-check", action="store_true")
     args = parser.parse_args()
 
     if args.benchmark:
         run_benchmark_for_all_test(check=not args.no_check)
     if args.profiling is not None:
-        dtype = torch.float32 if args.dtype == "float32" else torch.float16
-        run_profiling_for_test(args.profiling, dtype, S=args.S, K=args.K)
+        run_profiling_for_test(args.profiling, src_shape=(args.S, args.K))
 ```
 
 ---
 
 ## element-wise: practice_$op.py
+
+**核心方针：和 my_$op.py 同样照搬参考的形状网格 / `dim` / `iters`**，但每个形状只跑每种 (algorithm, dtype) 组合的最佳 kernel + torch baseline。如果某个形状下最佳 kernel 装不下（例如 H 超过 vec 宽度允许的最大 NUM_THREADS），跳过这个形状的该 kernel。
 
 ```python
 # -*- coding: utf-8 -*-
@@ -360,9 +357,10 @@ if __name__ == "__main__":
 practice_<op>.py - Practice-use <Op> benchmark
 ==============================================
 After learning the <op> kernel, use this for repeated practice:
-  - Only the best-performing kernel per dtype (FP32: f32x4, FP16: f16x8_pack)
+  - Only the best-performing kernel per (algorithm, dtype) combo
   - Two features only: check_correctness and benchmark
   - Plain kernel names (<op>_f32 / <op>_f16), no optimization hints
+  - Shape grid mirrors $op.py (do NOT replace with [1024,2048,4096]²).
 """
 
 import argparse
@@ -400,6 +398,7 @@ lib = load(
 
 def check_correctness(perf_func, x, tag, out: Optional[torch.Tensor] = None,
                       atol: float = 1e-5, rtol: float = 1e-5) -> bool:
+    # ref 必须照搬参考 $op.py 的 torch baseline 调用形式（dim 参数等不要改）。
     ref = torch.<op>(x)
     if out is not None:
         out.fill_(0)
@@ -419,6 +418,7 @@ def check_correctness(perf_func, x, tag, out: Optional[torch.Tensor] = None,
 
 def run_benchmark(perf_func, x, tag, out: Optional[torch.Tensor] = None,
                   warmup: int = 10, iters: int = 1000) -> float:
+    # iters 与参考 $op.py 保持一致。
     if out is not None:
         out.fill_(0)
         for _ in range(warmup):
@@ -445,30 +445,14 @@ def run_benchmark(perf_func, x, tag, out: Optional[torch.Tensor] = None,
 
 
 def run(check: bool = True):
-    Ss = [1024, 2048, 4096]
-    Ks = [1024, 2048, 4096]
+    # ============================================================
+    # 形状循环照搬参考 $op.py，每个形状只跑：
+    #   - 每个 (algorithm, dtype) 的最佳 kernel
+    #   - 对应 dtype 的 torch baseline
+    # 如果某形状下最佳 kernel 装不下，用 if 守卫跳过。
+    # ============================================================
     all_ok = True
-
-    for S, K in [(s, k) for s in Ss for k in Ks]:
-        print("-" * 85)
-        print(" " * 40 + f"S={S}, K={K}")
-
-        x = torch.randn((S, K)).cuda().float().contiguous()
-        y = torch.zeros_like(x)
-        if check:
-            all_ok &= check_correctness(lib.<op>_f32, x, "f32", y)
-            all_ok &= check_correctness(torch.<op>, x, "f32_th")
-        run_benchmark(lib.<op>_f32, x, "f32", y)
-        run_benchmark(partial(torch.<op>, out=y), x, "f32_th", y)
-
-        x_f16 = x.half().contiguous()
-        y_f16 = y.half().contiguous()
-        if check:
-            all_ok &= check_correctness(lib.<op>_f16, x_f16, "f16", y_f16, atol=1e-3, rtol=1e-3)
-            all_ok &= check_correctness(torch.<op>, x_f16, "f16_th", atol=1e-3, rtol=1e-3)
-        run_benchmark(lib.<op>_f16, x_f16, "f16", y_f16)
-        run_benchmark(partial(torch.<op>, out=y_f16), x_f16, "f16_th", y_f16)
-        print("-" * 85)
+    ...  # ← 参照参考 $op.py 的 (S, H/K) 循环写在这里
 
     if check:
         print("\n[summary] ALL PASS" if all_ok else "\n[summary] SOME FAIL")
@@ -485,22 +469,63 @@ if __name__ == "__main__":
 
 ---
 
-## element-wise: my_$op.sh
+## element-wise: my_profiling.py
 
-```bash
-#!/usr/bin/env bash
-set -e
+ncu 的薄 Python 封装。用一个**全局** `PROFILING_SHAPE` 常量——取"所有 kernel 都能跑的最大公共形状"（看参考 cu 里**每个** `DISPATCH_*_KERNEL` 宏的 H case 上限，取最严格的那个）。`--all` 跑全套，`--kernel <name>` 跑一个。
 
-name=${1:-<op>_f16}
-dtype=${2:-float16}
+```python
+import os
+import argparse
 
-ncu --nvtx \
-  --nvtx-include "profiling/" \
-  --set full \
-  --import-source yes \
-  -o "$name" \
-  -- python3 my_<op>.py --profiling "$name" --dtype "$dtype"
+dump_path = os.path.join(os.path.dirname(__file__), "profiling")
+os.makedirs(dump_path, exist_ok=True)
+
+# 统一形状：所有 kernel 都能跑的最大公共形状。
+# 比 dispatch 宏 H 上限最严格的那个再小一点也行，但通常直接取那个上限。
+PROFILING_SHAPE = (<S>, <largest_H_all_kernels_support>)
+S, K = PROFILING_SHAPE
+
+# kernel 名 -> dtype（仅记录用，my_<op>.py 的 match 分支已经硬编码了 dtype）。
+# torch baseline 不进 dict —— ncu 跑 torch 没意义。
+kernels_dict = {
+    "<op>_f32":          "float32",
+    "<op>_f32x4":        "float32",
+    "<op>_f16":          "float16",
+    "<op>_f16x2":        "float16",
+    "<op>_f16x8_pack":   "float16",
+}
+
+cmds = {
+    k: f'ncu --nvtx \
+        --nvtx-include "profiling/" \
+        --set full \
+        --import-source yes \
+        -f \
+        -o {os.path.join(dump_path, k)} \
+        -- python3 my_<op>.py --profiling {k} --S {S} --K {K}'
+    for k in kernels_dict
+}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Profile <op> kernels")
+    parser.add_argument("--all", "-a", action="store_true", help="Profile all kernels")
+    parser.add_argument("--kernel", "-k", type=str, help="Profile a specific kernel")
+    args = parser.parse_args()
+
+    if args.all:
+        for k, cmd in cmds.items():
+            print(f"Profiling {k}...")
+            os.system(cmd)
+    elif args.kernel:
+        if args.kernel in cmds:
+            print(f"Profiling {args.kernel}...")
+            os.system(cmds[args.kernel])
+        else:
+            print(f"Kernel {args.kernel} not found. Available: {list(cmds.keys())}")
 ```
+
+**`-f` 是必须的**——重跑时 ncu 默认会因为 `<name>.ncu-rep` 已存在而报错退出。
+**`--dtype` 不再传**——profiling 的 dtype 由 kernel 名唯一决定，写在 `my_<op>.py` 的 `match` 分支里就够了。
 
 ---
 
@@ -578,7 +603,7 @@ __global__ void <op>_f16_kernel(half *x, float *y, int N) {
 - **彻底删除 `out:` 参数**——`run_benchmark`、`run_profiling`、`check_correctness` 三个函数的签名里都不要保留 `out: Optional[torch.Tensor] = None`。reduce kernel 自己内部 `atomicAdd` 到一个新分配的 scalar tensor，调用形式是 `out = perf_func(x)`（或 `(a, b)`），不是 `perf_func(x, out)`。要么完全删掉 `out` 参数，要么至少把所有 `if out is not None:` 分支去掉。
 - `check_correctness` 的 ref 是 `torch.sum(x, dtype=torch.float32)` 之类（dot-product 是 `(a.float() * b.float()).sum()` 或 `torch.dot`）；
 - argparse 是否需要 `--dtype` 看具体 op：单 dtype（all_reduce f16-only）就去掉；多 dtype（dot-product 有 f32/f16）就保留。
-- `run_profiling` 同样不传 `out`，调用形式是 `run_profiling(perf_func, x, "profiling")` 而非 `(perf_func, x, "profiling", out)`。
+- `run_profiling` 同样不传 `out`，在内部只分配 `x`，调用形式 `perf_func(x)`。
 
 ---
 
@@ -589,22 +614,50 @@ __global__ void <op>_f16_kernel(half *x, float *y, int N) {
 
 ---
 
-## reduce: my_$op.sh
+## reduce: my_profiling.py
 
-```bash
-#!/usr/bin/env bash
-set -e
+和 element-wise 版几乎一样，差别有两处：
+- ncu 命令多一个 `-k regex:"<name>_kernel"`（限定只采样目标 kernel，避免 reduce 链上初始化 / 收尾 kernel 也被采进来）；
+- reduce 通常没有 H 上限不一致的问题，`PROFILING_SHAPE` 直接取参考 `$op.py` 形状网格里的某个代表形状即可。
 
-name=${1:-<best_kernel_name>}
+```python
+import os
+import argparse
 
-ncu --nvtx \
-  --nvtx-include "profiling/" \
-  -k regex:"$name"_kernel \
-  --set full \
-  --import-source yes \
-  -f \
-  -o "$name" \
-  -- python3 my_<op>.py --profiling "$name"
+dump_path = os.path.join(os.path.dirname(__file__), "profiling")
+os.makedirs(dump_path, exist_ok=True)
+
+PROFILING_SHAPE = (4096, 4096)
+S, K = PROFILING_SHAPE
+
+kernels_dict = {
+    "<op>_f16x8_pack": "float16",
+    # ... 其他 reduce kernel
+}
+
+cmds = {
+    k: f'ncu --nvtx \
+        --nvtx-include "profiling/" \
+        -k regex:"{k}_kernel" \
+        --set full \
+        --import-source yes \
+        -f \
+        -o {os.path.join(dump_path, k)} \
+        -- python3 my_<op>.py --profiling {k} --S {S} --K {K}'
+    for k in kernels_dict
+}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Profile <op> kernels")
+    parser.add_argument("--all", "-a", action="store_true")
+    parser.add_argument("--kernel", "-k", type=str)
+    args = parser.parse_args()
+    if args.all:
+        for k, cmd in cmds.items():
+            print(f"Profiling {k}..."); os.system(cmd)
+    elif args.kernel:
+        if args.kernel in cmds:
+            print(f"Profiling {args.kernel}..."); os.system(cmds[args.kernel])
+        else:
+            print(f"Kernel {args.kernel} not found. Available: {list(cmds.keys())}")
 ```
-
-注意 reduce 版的 ncu 命令多了 `-k regex:..._kernel`（限定只采样目标 kernel）和 `-f`（覆盖已有报告）。
